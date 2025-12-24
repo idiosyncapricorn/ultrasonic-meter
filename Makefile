@@ -1,0 +1,20 @@
+PORT = /dev/tty.usbserial-110
+
+upload:
+	mpremote connect $(PORT) cp main.py :
+
+run:
+	mpremote connect $(PORT) run main.py
+
+repl:
+	mpremote connect $(PORT) repl
+
+boot:
+	mpremote connect $(PORT) cp main.py :boot.py
+
+reset:
+	mpremote connect $(PORT) reset
+
+ls:
+	mpremote connect $(PORT) ls
+
