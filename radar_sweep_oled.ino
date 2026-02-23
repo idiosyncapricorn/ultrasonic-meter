@@ -1,20 +1,6 @@
 // ============================================================================
 // HC-SR04 + SERVO SWEEP + OLED DISPLAY — Arduino
-// Original: MicroPython on ESP32
-// Converted: Arduino C++ with 1.2" OLED I2C Display
-//
-// Wiring:
-//   HC-SR04 TRIG  → Pin 9
-//   HC-SR04 ECHO  → Pin 10
-//   Servo signal  → Pin 6  (PWM)
-//   Alert LED     → Pin 13 (built-in LED on most boards)
-//   OLED SDA      → Pin A4 (I2C)
-//   OLED SCL      → Pin A5 (I2C)
-//   OLED VCC      → 5V or 3.3V (check your module)
-//   OLED GND      → GND
-//   All GND       → GND
-//   HC-SR04 VCC   → 5V
-//   Servo VCC     → 5V (use external supply for heavy servos)
+// ACTIVE TRACKING: Angle-based micro-sweep + high-frequency pulses
 // ============================================================================
 
 #include <Servo.h>
@@ -26,10 +12,10 @@
 // OLED CONFIGURATION
 // ============================================================================
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1      // Reset pin # (or -1 if sharing Arduino reset pin)
-#define SCREEN_ADDRESS 0x3C   // Common I2C address (try 0x3D if this doesn't work)
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define SCREEN_ADDRESS 0x3C
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
@@ -39,8 +25,29 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 const int TRIG_PIN  = 9;
 const int ECHO_PIN  = 10;
-const int LED_PIN   = 13;   // Built-in LED; lights up when object < 10 cm
-const int SERVO_PIN = 6;    // Must be a PWM-capable pin
+const int LED_PIN   = 13;
+const int SERVO_PIN = 6;
+
+// ============================================================================
+// DETECTION & TRACKING CONFIGURATION
+// ============================================================================
+
+const float ALERT_DISTANCE_CM      = 30.0;  // Perimeter radius (cm)
+const float TRACK_DEAD_ZONE_CM     = 2.0;   // Ignore tiny distance noise
+
+const unsigned long CLEAR_HOLDOFF_MS   = 1500;  // ms clear before sweep resumes
+const unsigned long TRACKING_INTERVAL  = 20;    // ms between tracking pulses (50 Hz)
+const unsigned long SWEEP_INTERVAL     = 50;    // ms between sweep steps
+const unsigned long DISTANCE_INTERVAL  = 100;   // ms between normal distance checks
+const unsigned long DISPLAY_INTERVAL   = 200;   // ms between OLED refreshes
+const unsigned long PRINT_INTERVAL     = 500;   // ms between serial prints
+
+// Sweep config
+const int SWEEP_SPEED = 5;
+
+// Angle-based tracking micro-sweep
+const int TRACK_SWEEP_RANGE = 5;   // ±5 degrees around locked angle
+const int TRACK_SWEEP_STEP  = 2;   // step size for micro-sweep
 
 // ============================================================================
 // GLOBAL STATE
@@ -48,47 +55,115 @@ const int SERVO_PIN = 6;    // Must be a PWM-capable pin
 
 Servo myServo;
 
-float currentDistance = 0.0;
-int   currentAngle    = 0;
+float currentDistance  = 0.0;
+float previousDistance = 0.0;
+int   currentAngle     = 0;
 
 // Sweep state
 int sweepAngle     = 0;
-int sweepDirection = 1;       // 1 = increasing, -1 = decreasing
-const int SWEEP_SPEED = 5;    // Degrees per step (lower = smoother/slower)
+int sweepDirection = 1;
 
-// Timing (millis-based, non-blocking)
-unsigned long lastDistanceTime = 0;
-unsigned long lastSweepTime    = 0;
-unsigned long lastPrintTime    = 0;
-unsigned long lastDisplayTime  = 0;
+// Detection / tracking state
+enum RadarMode { SWEEPING, TRACKING };
+RadarMode mode    = SWEEPING;
+int   lockedAngle = 0;
+unsigned long clearedAt = 0;
 
-const unsigned long DISTANCE_INTERVAL = 100;  // ms
-const unsigned long SWEEP_INTERVAL    = 50;   // ms
-const unsigned long PRINT_INTERVAL    = 1000; // ms
-const unsigned long DISPLAY_INTERVAL  = 200;  // ms (update OLED 5x per second)
+// Angle-based tracking internals
+int   trackScanAngle     = 0;
+bool  trackScanDirection = 1;   // 1 = right, 0 = left
+float bestDistance       = 9999;
+int   bestAngle          = 0;
+
+// Timing
+unsigned long lastDistanceTime  = 0;
+unsigned long lastTrackingTime  = 0;
+unsigned long lastSweepTime     = 0;
+unsigned long lastPrintTime     = 0;
+unsigned long lastDisplayTime   = 0;
 
 // ============================================================================
 // DISTANCE MEASUREMENT
 // ============================================================================
 
 float measureDistance() {
-    // Send a 10 µs trigger pulse
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
     delayMicroseconds(10);
     digitalWrite(TRIG_PIN, LOW);
 
-    // Measure echo pulse width (timeout = 30 ms → ~5 m max range)
     long duration = pulseIn(ECHO_PIN, HIGH, 30000UL);
+    if (duration == 0) return -1.0;
+    return (duration * 0.0343) / 2.0;
+}
 
-    if (duration == 0) {
-        return -1.0;  // Timeout / no echo
+// ============================================================================
+// HIGH-FREQUENCY TRACKING PULSE
+// (just keeps distance updated + handles target loss)
+// ============================================================================
+
+void runTrackingPulse() {
+    float d = measureDistance();
+    if (d <= 0) return;
+
+    previousDistance = currentDistance;
+    currentDistance  = d;
+
+    // If object has left the perimeter, start the clear holdoff
+    bool objectDetected = (currentDistance > 0 && currentDistance <= ALERT_DISTANCE_CM);
+    if (!objectDetected) {
+        if (clearedAt == 0) clearedAt = millis();
+    } else {
+        clearedAt = 0;
+    }
+}
+
+// ============================================================================
+// ANGLE-BASED MICRO-SWEEP TRACKING
+// ============================================================================
+
+void runAngleTracking() {
+    // Sweep left/right around locked angle
+    if (trackScanDirection) {
+        trackScanAngle += TRACK_SWEEP_STEP;
+        if (trackScanAngle >= lockedAngle + TRACK_SWEEP_RANGE) {
+            trackScanAngle = lockedAngle + TRACK_SWEEP_RANGE;
+            trackScanDirection = 0;
+        }
+    } else {
+        trackScanAngle -= TRACK_SWEEP_STEP;
+        if (trackScanAngle <= lockedAngle - TRACK_SWEEP_RANGE) {
+            trackScanAngle = lockedAngle - TRACK_SWEEP_RANGE;
+            trackScanDirection = 1;
+        }
     }
 
-    // Distance in cm: sound travels 0.0343 cm/µs, divide by 2 for one-way
-    float distance = (duration * 0.0343) / 2.0;
-    return distance;
+    trackScanAngle = constrain(trackScanAngle, 0, 180);
+    myServo.write(trackScanAngle);
+    currentAngle = trackScanAngle;
+    delay(5);  // small settle time for servo + echo
+
+    // Measure distance at this angle
+    float d = measureDistance();
+    if (d > 0 && d < bestDistance - TRACK_DEAD_ZONE_CM) {
+        bestDistance = d;
+        bestAngle    = trackScanAngle;
+    }
+
+    // When we hit either edge of the micro-sweep, move to best angle
+    bool atRightEdge = (trackScanDirection == 1 && trackScanAngle == lockedAngle + TRACK_SWEEP_RANGE);
+    bool atLeftEdge  = (trackScanDirection == 0 && trackScanAngle == lockedAngle - TRACK_SWEEP_RANGE);
+
+    if (atRightEdge || atLeftEdge) {
+        myServo.write(bestAngle);
+        currentAngle = bestAngle;
+        lockedAngle  = bestAngle;
+
+        // Reset for next micro-sweep
+        bestDistance = 9999;
+        bestAngle    = lockedAngle;
+    }
 }
 
 // ============================================================================
@@ -116,15 +191,19 @@ void updateSweep() {
 
 void updateDisplay() {
     display.clearDisplay();
-    
+
     // Title
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.println(F("RADAR SWEEP"));
+    if (mode == TRACKING) {
+        display.println(F(">> TRACKING TARGET <<"));
+    } else {
+        display.println(F("RADAR SWEEP"));
+    }
     display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
-    
-    // Distance (large font)
+
+    // Distance
     display.setTextSize(2);
     display.setCursor(0, 18);
     display.print(F("D:"));
@@ -134,26 +213,32 @@ void updateDisplay() {
     } else {
         display.println(F("--.- cm"));
     }
-    
-    // Servo angle (large font)
+
+    // Angle
     display.setCursor(0, 38);
     display.print(F("A:"));
     display.print(currentAngle);
-    display.println(F(" deg"));
-    
-    // Visual servo indicator (bottom bar)
+    if (mode == TRACKING) {
+        display.println(F(" TRK"));
+    } else {
+        display.println(F(" deg"));
+    }
+
+    // Position bar
     display.setTextSize(1);
-    display.setCursor(0, 56);
-    display.print(F("0"));
-    display.setCursor(60, 56);
-    display.print(F("90"));
-    display.setCursor(115, 56);
-    display.print(F("180"));
-    
-    // Draw servo position marker
+    display.setCursor(0,   56); display.print(F("0"));
+    display.setCursor(60,  56); display.print(F("90"));
+    display.setCursor(115, 56); display.print(F("180"));
+
     int markerX = map(currentAngle, 0, 180, 0, SCREEN_WIDTH - 1);
-    display.fillCircle(markerX, 58, 2, SSD1306_WHITE);
-    
+
+    if (mode == TRACKING) {
+        display.drawFastVLine(markerX, 53, 9, SSD1306_WHITE);
+        display.drawFastHLine(markerX - 3, 57, 7, SSD1306_WHITE);
+    } else {
+        display.fillCircle(markerX, 58, 2, SSD1306_WHITE);
+    }
+
     display.display();
 }
 
@@ -164,12 +249,11 @@ void updateDisplay() {
 void setup() {
     Serial.begin(115200);
 
-    // Initialize OLED
-    if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
         Serial.println(F("SSD1306 allocation failed"));
-        for(;;); // Halt if OLED init fails
+        for (;;);
     }
-    
+
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
@@ -179,30 +263,23 @@ void setup() {
     display.display();
     delay(1000);
 
-    // Initialize hardware pins
     pinMode(TRIG_PIN, OUTPUT);
     pinMode(ECHO_PIN, INPUT);
     pinMode(LED_PIN,  OUTPUT);
-
     digitalWrite(TRIG_PIN, LOW);
     digitalWrite(LED_PIN,  LOW);
 
     myServo.attach(SERVO_PIN);
-    myServo.write(0);   // Start at 0°
+    myServo.write(0);
     delay(500);
 
-    Serial.println();
     Serial.println(F("============================================================"));
-    Serial.println(F("  HC-SR04 + SERVO SWEEP + OLED — Arduino"));
+    Serial.println(F("  HC-SR04 + SERVO SWEEP + OLED — Active Tracking Edition"));
     Serial.println(F("============================================================"));
-    Serial.println(F("  Servo sweeps 0°-180° continuously"));
-    Serial.println(F("  LED lights when object detected under 10 cm"));
-    Serial.println(F("  OLED displays distance and angle in real-time"));
+    Serial.print  (F("  Alert perimeter  : ")); Serial.print(ALERT_DISTANCE_CM);   Serial.println(F(" cm"));
+    Serial.print  (F("  Tracking rate    : ")); Serial.print(1000/TRACKING_INTERVAL); Serial.println(F(" Hz"));
     Serial.println(F("============================================================"));
-    Serial.println(F("Starting..."));
-    Serial.println();
-    
-    // Show ready message on OLED
+
     display.clearDisplay();
     display.setCursor(0, 20);
     display.setTextSize(2);
@@ -219,27 +296,69 @@ void loop() {
     unsigned long now = millis();
 
     // ----------------------------------------------------------------
-    // TASK 1: Distance sensing (every 100 ms)
+    // TASK 1: Normal distance sensing + state transitions (SWEEPING)
     // ----------------------------------------------------------------
-    if (now - lastDistanceTime >= DISTANCE_INTERVAL) {
+    if (mode == SWEEPING && (now - lastDistanceTime >= DISTANCE_INTERVAL)) {
         float d = measureDistance();
-        if (d > 0) {
-            currentDistance = d;
+        if (d > 0) currentDistance = d;
+
+        bool objectDetected = (currentDistance > 0 && currentDistance <= ALERT_DISTANCE_CM);
+
+        if (objectDetected) {
+            // Object entered perimeter — lock on + start tracking
+            mode        = TRACKING;
+            lockedAngle = currentAngle;
+
+            trackScanAngle     = lockedAngle;
+            trackScanDirection = 1;
+            bestDistance       = 9999;
+            bestAngle          = lockedAngle;
+            clearedAt          = 0;
+
+            myServo.write(lockedAngle);
+
+            Serial.print(F(">> LOCK + TRACK — object at "));
+            Serial.print(currentDistance, 1);
+            Serial.print(F(" cm | angle "));
+            Serial.print(lockedAngle);
+            Serial.println(F(" deg"));
         }
-        digitalWrite(LED_PIN, (currentDistance > 0 && currentDistance < 10) ? HIGH : LOW);
+
+        digitalWrite(LED_PIN, objectDetected ? HIGH : LOW);
         lastDistanceTime = now;
     }
 
     // ----------------------------------------------------------------
-    // TASK 2: Servo sweep (every 50 ms)
+    // TASK 2: High-frequency tracking (TRACKING mode)
     // ----------------------------------------------------------------
-    if (now - lastSweepTime >= SWEEP_INTERVAL) {
+    if (mode == TRACKING && (now - lastTrackingTime >= TRACKING_INTERVAL)) {
+        runTrackingPulse();   // keep distance updated + loss detection
+        runAngleTracking();   // micro-sweep around locked angle
+
+        lastTrackingTime = now;
+
+        // Check if hold-off has expired → resume sweep
+        if (clearedAt != 0 && (now - clearedAt) >= CLEAR_HOLDOFF_MS) {
+            mode       = SWEEPING;
+            sweepAngle = currentAngle;
+            clearedAt  = 0;
+            Serial.println(F(">> Target lost — resuming sweep"));
+        }
+
+        bool objectDetected = (currentDistance > 0 && currentDistance <= ALERT_DISTANCE_CM);
+        digitalWrite(LED_PIN, objectDetected ? HIGH : LOW);
+    }
+
+    // ----------------------------------------------------------------
+    // TASK 3: Servo sweep (SWEEPING mode)
+    // ----------------------------------------------------------------
+    if (mode == SWEEPING && (now - lastSweepTime >= SWEEP_INTERVAL)) {
         updateSweep();
         lastSweepTime = now;
     }
 
     // ----------------------------------------------------------------
-    // TASK 3: OLED display update (every 200 ms)
+    // TASK 4: OLED display update
     // ----------------------------------------------------------------
     if (now - lastDisplayTime >= DISPLAY_INTERVAL) {
         updateDisplay();
@@ -247,14 +366,22 @@ void loop() {
     }
 
     // ----------------------------------------------------------------
-    // TASK 4: Serial status print (every 1 second)
+    // TASK 5: Serial status
     // ----------------------------------------------------------------
     if (now - lastPrintTime >= PRINT_INTERVAL) {
-        Serial.print(F("Distance: "));
-        Serial.print(currentDistance, 1);
-        Serial.print(F(" cm | Servo: "));
-        Serial.print(currentAngle);
-        Serial.println(F(" deg"));
+        if (mode == TRACKING) {
+            Serial.print(F("[TRACKING] Dist: "));
+            Serial.print(currentDistance, 1);
+            Serial.print(F(" cm | Angle: "));
+            Serial.print(currentAngle);
+            Serial.println(F(" deg"));
+        } else {
+            Serial.print(F("[SWEEP]    Dist: "));
+            Serial.print(currentDistance, 1);
+            Serial.print(F(" cm | Angle: "));
+            Serial.print(currentAngle);
+            Serial.println(F(" deg"));
+        }
         lastPrintTime = now;
     }
 }
